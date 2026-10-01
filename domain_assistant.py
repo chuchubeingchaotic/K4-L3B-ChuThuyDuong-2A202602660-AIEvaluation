@@ -16,7 +16,11 @@ import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+try:
+    from datetime import UTC, datetime
+except ImportError:
+    from datetime import datetime, timezone
+    UTC = timezone.utc
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -242,6 +246,68 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        import json
+        import urllib.request
+        import urllib.error
+
+        model_name = self.model
+        if model_name.startswith("models/"):
+            model_name = model_name[len("models/") :]
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            headers={"Content-Type": "application/json"},
+        )
+
+        last_error = None
+        for attempt in range(6):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    candidates = res.get("candidates", [])
+                    if not candidates:
+                        raise RuntimeError(f"Gemini returned no candidates: {res}")
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if not parts:
+                        raise RuntimeError(f"Gemini returned no parts: {res}")
+                    answer = parts[0].get("text", "").strip()
+                    if not answer:
+                        raise RuntimeError("Gemini returned empty text")
+                    time.sleep(2.5)
+                    return answer
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code in (429, 503):
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Gemini HTTP {exc.code}: {body}") from exc
+            except Exception as exc:
+                last_error = exc
+                time.sleep(3 * (attempt + 1))
+        raise RuntimeError(f"Failed to generate after retries: {last_error}")
+
+
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -264,6 +330,12 @@ class OpenAIGenerator:
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
         return answer
+
+
+def get_default_generator() -> TextGenerator:
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        return GeminiGenerator()
+    return OpenAIGenerator()
 
 
 @dataclass(frozen=True)
@@ -299,7 +371,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else get_default_generator(),
             top_k,
         )
 
